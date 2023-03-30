@@ -16,18 +16,9 @@
 
 package org.springframework.cloud.fn.consumer.jdbc;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 import javax.sql.DataSource;
-
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 
 import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.FactoryBean;
@@ -38,9 +29,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.expression.EvaluationContext;
-import org.springframework.expression.EvaluationException;
-import org.springframework.expression.Expression;
-import org.springframework.expression.spel.SpelParseException;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.integration.aggregator.DefaultAggregatingMessageGroupProcessor;
@@ -48,25 +36,17 @@ import org.springframework.integration.aggregator.MessageCountReleaseStrategy;
 import org.springframework.integration.config.AggregatorFactoryBean;
 import org.springframework.integration.dsl.IntegrationFlow;
 import org.springframework.integration.dsl.IntegrationFlowBuilder;
-import org.springframework.integration.dsl.IntegrationFlows;
 import org.springframework.integration.expression.ExpressionUtils;
 import org.springframework.integration.expression.ValueExpression;
 import org.springframework.integration.jdbc.JdbcMessageHandler;
-import org.springframework.integration.jdbc.SqlParameterSourceFactory;
 import org.springframework.integration.json.JsonPropertyAccessor;
 import org.springframework.integration.store.MessageGroupStore;
 import org.springframework.integration.store.SimpleMessageStore;
-import org.springframework.integration.support.MutableMessage;
-import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
-import org.springframework.jdbc.core.namedparam.SqlParameterSource;
 import org.springframework.jdbc.datasource.init.DataSourceInitializer;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
-import org.springframework.messaging.Message;
 import org.springframework.messaging.MessageHandler;
-import org.springframework.messaging.MessageHeaders;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MimeTypeUtils;
-import org.springframework.util.MultiValueMap;
+
+import static java.util.Objects.isNull;
 
 /**
  * @author Eric Bottard
@@ -81,14 +61,9 @@ import org.springframework.util.MultiValueMap;
 @EnableConfigurationProperties(JdbcConsumerProperties.class)
 public class JdbcConsumerConfiguration {
 
-	private static final Log logger = LogFactory.getLog(JdbcConsumerConfiguration.class);
-
-	private static final Object NOT_SET = new Object();
-
 	private final JdbcConsumerProperties properties;
 
 	private SpelExpressionParser spelExpressionParser = new SpelExpressionParser();
-
 	private EvaluationContext evaluationContext;
 
 	public JdbcConsumerConfiguration(JdbcConsumerProperties properties, BeanFactory beanFactory) {
@@ -103,38 +78,18 @@ public class JdbcConsumerConfiguration {
 		return new ShorthandMapConverter();
 	}
 
-	private static boolean convertibleContentType(String contentType) {
-		return contentType.contains("text") || contentType.contains("json") || contentType.contains("x-spring-tuple");
-	}
-
-	private static String generateSql(String tableName, Set<String> columns) {
-		StringBuilder builder = new StringBuilder("INSERT INTO ");
-		StringBuilder questionMarks = new StringBuilder(") VALUES (");
-		builder.append(tableName).append("(");
-		int i = 0;
-
-		for (String column : columns) {
-			if (i++ > 0) {
-				builder.append(", ");
-				questionMarks.append(", ");
-			}
-			builder.append(column);
-			questionMarks.append(':').append(column);
-		}
-		builder.append(questionMarks).append(")");
-		return builder.toString();
-	}
-
 	@Bean
-	IntegrationFlow jdbcConsumerFlow(@Qualifier("aggregator") MessageHandler aggregator,
-									JdbcMessageHandler jdbcMessageHandler) {
-
-		final IntegrationFlowBuilder builder =
-				IntegrationFlows.from(Consumer.class, gateway -> gateway.beanName("jdbcConsumer"));
+	IntegrationFlow jdbcConsumerFlow(@Qualifier("aggregator") MessageHandler aggregator, JdbcMessageHandler jdbcMessageHandler, DataSource dataSource) {
+		final IntegrationFlowBuilder builder = IntegrationFlow.from(Consumer.class, gateway -> gateway.beanName("jdbcConsumer"));
 		if (properties.getBatchSize() > 1 || properties.getIdleTimeout() > 0) {
 			builder.handle(aggregator);
 		}
-		return builder.handle(jdbcMessageHandler).get();
+
+		if (isNull(properties.getSchemaNameExpression()) || properties.getSchemaNameExpression().length() == 0) {
+			return builder.handle(jdbcMessageHandler).get();
+		}
+
+		return builder.handle(new MultiSchemaAwareJdbcMessageHandler(properties, spelExpressionParser, evaluationContext, dataSource)).get();
 	}
 
 	@Bean
@@ -162,62 +117,7 @@ public class JdbcConsumerConfiguration {
 
 	@Bean
 	public JdbcMessageHandler jdbcMessageHandler(DataSource dataSource) {
-		final MultiValueMap<String, Expression> columnExpressionVariations = new LinkedMultiValueMap<>();
-		for (Map.Entry<String, String> entry : this.properties.getColumnsMap().entrySet()) {
-			String value = entry.getValue();
-			columnExpressionVariations.add(entry.getKey(), this.spelExpressionParser.parseExpression(value));
-			if (!value.startsWith("payload")) {
-				String qualified = "payload." + value;
-				try {
-					columnExpressionVariations.add(entry.getKey(),
-							this.spelExpressionParser.parseExpression(qualified));
-				}
-				catch (SpelParseException e) {
-					logger.info("failed to parse qualified fallback expression " + qualified +
-							"; be sure your expression uses the 'payload.' prefix where necessary");
-				}
-			}
-		}
-		JdbcMessageHandler jdbcMessageHandler = new JdbcMessageHandler(dataSource,
-				generateSql(this.properties.getTableName(), columnExpressionVariations.keySet())) {
-
-			@Override
-			protected void handleMessageInternal(final Message<?> message) {
-				Message<?> convertedMessage = message;
-				if (message.getPayload() instanceof byte[] || message.getPayload() instanceof Iterable) {
-
-					final String contentType = message.getHeaders().containsKey(MessageHeaders.CONTENT_TYPE)
-							? message.getHeaders().get(MessageHeaders.CONTENT_TYPE).toString()
-							: MimeTypeUtils.APPLICATION_JSON_VALUE;
-					if (message.getPayload() instanceof Iterable) {
-						Stream<Object> messageStream =
-								StreamSupport.stream(((Iterable<?>) message.getPayload()).spliterator(), false)
-										.map(payload -> {
-											if (payload instanceof byte[]) {
-												return convertibleContentType(contentType) ?
-														new String(((byte[]) payload)) : payload;
-											}
-											else {
-												return payload;
-											}
-										});
-						convertedMessage = new MutableMessage<>(messageStream.collect(Collectors.toList()),
-								message.getHeaders());
-					}
-					else {
-						if (convertibleContentType(contentType)) {
-							convertedMessage = new MutableMessage<>(new String(((byte[]) message.getPayload())),
-									message.getHeaders());
-						}
-					}
-				}
-				super.handleMessageInternal(convertedMessage);
-			}
-		};
-		SqlParameterSourceFactory parameterSourceFactory =
-				new ParameterFactory(columnExpressionVariations, this.evaluationContext);
-		jdbcMessageHandler.setSqlParameterSourceFactory(parameterSourceFactory);
-		return jdbcMessageHandler;
+		return JdbcMessageHandlerFactory.jdbcMessageHandler(spelExpressionParser, evaluationContext, properties, dataSource, null);
 	}
 
 	@ConditionalOnProperty("jdbc.consumer.initialize")
@@ -231,59 +131,12 @@ public class JdbcConsumerConfiguration {
 		if ("true".equals(properties.getInitialize())) {
 			databasePopulator.addScript(
 					new DefaultInitializationScriptResource(this.properties.getTableName(),
-							this.properties.getColumnsMap().keySet()));
+																									this.properties.getColumnsMap().keySet()));
 		}
 		else {
 			databasePopulator.addScript(resourceLoader.getResource(this.properties.getInitialize()));
 		}
 		return dataSourceInitializer;
-	}
-
-	private static final class ParameterFactory implements SqlParameterSourceFactory {
-
-		private final MultiValueMap<String, Expression> columnExpressions;
-
-		private final EvaluationContext context;
-
-		ParameterFactory(MultiValueMap<String, Expression> columnExpressions, EvaluationContext context) {
-			this.columnExpressions = columnExpressions;
-			this.context = context;
-		}
-
-		@Override
-		public SqlParameterSource createParameterSource(Object o) {
-			if (!(o instanceof Message)) {
-				throw new IllegalArgumentException("Unable to handle type " + o.getClass().getName());
-			}
-			Message<?> message = (Message<?>) o;
-			MapSqlParameterSource parameterSource = new MapSqlParameterSource();
-			for (Map.Entry<String, List<Expression>> entry : this.columnExpressions.entrySet()) {
-				String key = entry.getKey();
-				List<Expression> spels = entry.getValue();
-				Object value = NOT_SET;
-				EvaluationException lastException = null;
-				for (Expression spel : spels) {
-					try {
-						value = spel.getValue(context, message);
-						break;
-					}
-					catch (EvaluationException e) {
-						lastException = e;
-					}
-				}
-				if (value == NOT_SET) {
-					if (lastException != null) {
-						logger.info("Could not find value for column '" + key + "': " + lastException.getMessage());
-					}
-					parameterSource.addValue(key, null);
-				}
-				else {
-					parameterSource.addValue(key, value);
-				}
-			}
-			return parameterSource;
-		}
-
 	}
 
 }

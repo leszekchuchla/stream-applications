@@ -33,6 +33,11 @@ public class JdbcConsumerProperties {
 	private ShorthandMapConverter shorthandMapConverter;
 
 	/**
+	 * The name of the schema to write into.
+	 */
+	private String schemaNameExpression;
+
+	/**
 	 * The name of the table to write into.
 	 */
 	private String tableName = "messages";
@@ -59,6 +64,14 @@ public class JdbcConsumerProperties {
 	private long idleTimeout = -1L;
 
 	private Map<String, String> columnsMap;
+
+	public String getSchemaNameExpression() {
+		return schemaNameExpression;
+	}
+
+	public void setSchemaNameExpression(String schemaNameExpression) {
+		this.schemaNameExpression = schemaNameExpression;
+	}
 
 	public String getTableName() {
 		return this.tableName;
