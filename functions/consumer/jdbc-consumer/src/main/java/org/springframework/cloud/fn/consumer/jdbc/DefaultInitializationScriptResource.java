@@ -52,8 +52,7 @@ public class DefaultInitializationScriptResource extends ByteArrayResource {
 			result.append(column).append(" VARCHAR(2000)");
 		}
 		result.append(");\n");
-		logger.debug(String.format("Generated the following initializing script for table %s:\n%s", tableName,
-				result.toString()));
+		logger.debug(String.format("Generated the following initializing script for table %s:\n%s", tableName, result));
 		return result.toString();
 	}
 
